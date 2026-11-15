@@ -9,6 +9,7 @@ import { supabase } from '@/lib/supabase';
 import type { Transaction } from '@/types';
 
 type ModalType = 'deposit' | 'withdraw' | 'bindGcash' | 'bindMaya' | null;
+type QrPayment = { orderId: string; qrCode: string; amount: number };
 
 export default function Account() {
   const { profile, signOut, refreshProfile } = useAuth();
@@ -20,6 +21,7 @@ export default function Account() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [qrPayment, setQrPayment] = useState<QrPayment | null>(null);
 
   useEffect(() => {
     if (profile?.id) {
@@ -35,6 +37,35 @@ export default function Account() {
     }
   }, [profile?.id]);
 
+  useEffect(() => {
+    if (!qrPayment?.orderId || !profile?.id) return;
+    let active = true;
+    const checkPayment = async () => {
+      const { data, error: queryError } = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('payment_order_id', qrPayment.orderId)
+        .eq('user_id', profile.id)
+        .maybeSingle();
+      if (!active || queryError || !data) return;
+      setTransactions((current) => {
+        const filtered = current.filter((item) => !String(item.id).startsWith(`pending-${qrPayment.orderId}`));
+        return [data as Transaction, ...filtered];
+      });
+      if (data.status === 'completed') {
+        setSuccess('Payment confirmed! Your Vantrex balance has been credited.');
+        setQrPayment(null);
+        await refreshProfile();
+      } else if (data.status === 'failed') {
+        setError('Payment was not completed. Please create a new deposit.');
+        setQrPayment(null);
+      }
+    };
+    void checkPayment();
+    const interval = window.setInterval(() => void checkPayment(), 4000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [qrPayment?.orderId, profile?.id, refreshProfile]);
+
   const closeModal = () => {
     setModal(null);
     setAmount('');
@@ -45,26 +76,46 @@ export default function Account() {
 
   const handleDeposit = async () => {
     if (!profile || !amount) return;
-    const val = parseFloat(amount);
-    if (isNaN(val) || val <= 0) {
-      setError('Enter a valid amount');
+    const val = Number(amount);
+    if (!Number.isFinite(val) || val < 500 || Math.round(val * 100) !== val * 100) {
+      setError('Minimum deposit is ₱500. Enter a valid amount.');
       return;
     }
     setLoading(true);
     setError(null);
+    setSuccess(null);
     try {
-      const { error: txError } = await supabase.from('transactions').insert({
+      const workerUrl = (import.meta.env.VITE_PAYMENT_WORKER_URL as string | undefined)?.replace(/\/$/, '');
+      if (!workerUrl || workerUrl.includes('YOUR-WORKER')) {
+        throw new Error('Payment Worker URL is not configured. Set VITE_PAYMENT_WORKER_URL in your .env file.');
+      }
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error('Your session expired. Please sign in again.');
+      const response = await fetch(`${workerUrl}/vantrex/create-paymongo-payment`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ amount: val }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success || !result.qrCode || !result.orderId) {
+        throw new Error(result.message || 'Unable to create QR payment. Please try again.');
+      }
+      setQrPayment({ orderId: result.orderId, qrCode: result.qrCode, amount: val });
+      setSuccess('QR code ready. Complete payment to receive your deposit credit.');
+      setTransactions((current) => [{
+        id: `pending-${result.orderId}`,
         user_id: profile.id,
         type: 'deposit',
         amount: val,
         status: 'pending',
-        description: 'Deposit request (pending confirmation)',
-      });
-      if (txError) throw txError;
-      setSuccess('Deposit request submitted! It will be credited after confirmation.');
-      setTimeout(closeModal, 2500);
+        description: `PayMongo QRPH deposit ${result.orderId}`,
+        created_at: new Date().toISOString(),
+      } as Transaction, ...current]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to submit deposit');
+      setError(err instanceof Error ? err.message : 'Failed to create deposit payment');
     } finally {
       setLoading(false);
     }
@@ -375,7 +426,17 @@ export default function Account() {
               </div>
             )}
 
-            {(modal === 'deposit' || modal === 'withdraw') && (
+            {(modal === 'deposit' && qrPayment) ? (
+              <div className="text-center space-y-3">
+                <p className="text-white text-sm font-semibold">Scan to Pay ₱{qrPayment.amount.toLocaleString('en-PH', { minimumFractionDigits: 2 })}</p>
+                <div className="bg-white rounded-2xl p-3 inline-block">
+                  <img src={qrPayment.qrCode} alt="PayMongo QRPH payment code" className="w-64 h-64 object-contain" />
+                </div>
+                <p className="text-cyan-300 text-xs font-semibold">Waiting for payment confirmation…</p>
+                <p className="text-navy-400 text-[11px]">Open GCash, choose Scan QR, and scan this code. Your balance updates only after PayMongo confirms the payment.</p>
+                <button onClick={() => setModal(null)} className="w-full py-3 rounded-xl bg-navy-800 text-white text-sm font-semibold">Close QR</button>
+              </div>
+            ) : (modal === 'deposit' || modal === 'withdraw') && (
               <>
                 <div className="space-y-1.5 mb-4">
                   <label className="text-xs font-medium text-navy-300 ml-1">
@@ -387,10 +448,14 @@ export default function Account() {
                       type="number"
                       value={amount}
                       onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.00"
+                      placeholder={modal === 'deposit' ? '500.00 minimum' : '0.00'}
+                      min={modal === 'deposit' ? 500 : 0}
                       className="w-full bg-navy-950 border border-navy-700 rounded-xl pl-9 pr-4 py-3.5 text-white placeholder:text-navy-600 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/30 transition-all text-lg font-semibold"
                     />
                   </div>
+                  {modal === 'deposit' && (
+                    <p className="text-navy-500 text-[11px] ml-1 mt-1">Minimum deposit: ₱500 via PayMongo QRPH</p>
+                  )}
                   {modal === 'withdraw' && (
                     <p className="text-navy-500 text-[11px] ml-1 mt-1">
                       Available: ₱{Number(profile?.balance || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 })}
@@ -409,7 +474,7 @@ export default function Account() {
                   {loading ? (
                     <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                   ) : (
-                    modal === 'deposit' ? 'Submit Deposit' : 'Submit Withdrawal'
+                    modal === 'deposit' ? 'Generate GCash QR' : 'Submit Withdrawal'
                   )}
                 </button>
               </>
