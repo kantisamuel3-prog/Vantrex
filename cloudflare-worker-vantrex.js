@@ -1,8 +1,8 @@
-const PROJECT_ID = "investpro-2dafb";
+const PROJECT_ID = "gcash-d6296";
 
 
 const FIREBASE_API_KEY =
-  "AIzaSyCIBDQOIiCOgfV4pMCUr0oUCNZoIDYDqGk";
+  "AIzaSyDkmjf-bp60OikO8l8YLIs2HXd5y1dQlXA";
 
 
 const jsonHeaders = {
@@ -657,6 +657,11 @@ function getServiceAccount(
       env.FIREBASE_SERVICE_ACCOUNT_JSON
     );
 
+  // LINISIN ANG PRIVATE KEY PARA IWASAN ANG FIREBASE AUTH ERROR
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+  }
+
   if (
     !serviceAccount.client_email ||
     !serviceAccount.private_key
@@ -1256,14 +1261,13 @@ async function firestoreCommitTransaction(
 }
 
 /* =========================================================
-   FIREBASE AUTH
+   SUPABASE AUTH (Pinalitan ang Firebase)
    ========================================================= */
 
 async function verifyFirebaseIdToken(
   env,
   request
 ) {
-
   const authorization =
     request.headers.get(
       "Authorization"
@@ -1274,100 +1278,43 @@ async function verifyFirebaseIdToken(
       "Bearer "
     )
   ) {
-
     throw new Error(
-      "Missing Firebase Authorization token."
+      "Missing Supabase Authorization token."
     );
-
   }
 
-  const idToken =
+  const token =
     authorization
       .slice(7)
       .trim();
 
-  if (!idToken) {
-
+  if (!token) {
     throw new Error(
-      "Missing Firebase ID token."
+      "Missing Supabase ID token."
     );
-
   }
-
-  const response =
-    await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
-        FIREBASE_API_KEY
-      )}`,
-      {
-
-        method:
-          "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify({
-            idToken
-          })
-
-      }
-    );
-
-  const text =
-    await response.text();
-
-  let data = null;
 
   try {
+    // I-decode ang Supabase JWT para makuha ang user ID (sub)
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+    
+    const payload = JSON.parse(jsonPayload);
+    if (!payload.sub) {
+      throw new Error("Invalid token payload");
+    }
 
-    data =
-      text
-        ? JSON.parse(text)
-        : null;
-
-  } catch {}
-
-  if (
-    !response.ok ||
-    !data?.users?.length
-  ) {
-
-    throw new Error(
-      "Invalid or expired Firebase ID token."
-    );
-
+    return {
+      uid: payload.sub,
+      email: payload.email || "",
+      displayName: payload.user_metadata?.username || ""
+    };
+  } catch (e) {
+    throw new Error("Invalid or expired Supabase ID token.");
   }
-
-  const user =
-    data.users[0];
-
-  if (
-    user.disabled === true
-  ) {
-
-    throw new Error(
-      "Firebase user account is disabled."
-    );
-
-  }
-
-  return {
-
-    uid:
-      user.localId,
-
-    email:
-      user.email || "",
-
-    displayName:
-      user.displayName || ""
-
-  };
-
 }
 
 
@@ -3852,180 +3799,18 @@ async function handleRewardCode(env, request) {
    ROUTER
    ========================================================= */
 
-
-/* =========================================================
-   VANTREX / SUPABASE + PAYMONGO QRPH
-   This is separate from the original Firebase recharge flow.
-   ========================================================= */
-function vantrexSupabaseConfig(env) {
-  const url = String(env.SUPABASE_URL || '').replace(/\/$/, '');
-  const anon = String(env.SUPABASE_ANON_KEY || '').trim();
-  const service = String(env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-  if (!url || !anon || !service) throw new Error('Missing SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY Worker secret.');
-  return { url, anon, service };
-}
-
-async function vantrexSupabaseUser(env, request) {
-  const { url, anon } = vantrexSupabaseConfig(env);
-  const auth = request.headers.get('Authorization') || '';
-  if (!auth.startsWith('Bearer ')) throw new Error('Please sign in again.');
-  const response = await fetch(`${url}/auth/v1/user`, {
-    headers: { apikey: anon, Authorization: auth }
-  });
-  if (!response.ok) throw new Error('Invalid or expired Supabase session. Please sign in again.');
-  const user = await response.json();
-  if (!user?.id) throw new Error('Unable to verify signed-in user.');
-  return user;
-}
-
-async function vantrexDb(env, path, options = {}) {
-  const { url, service } = vantrexSupabaseConfig(env);
-  const response = await fetch(`${url}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: service,
-      Authorization: `Bearer ${service}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    }
-  });
-  const body = await response.text();
-  let data = null;
-  try { data = body ? JSON.parse(body) : null; } catch {}
-  if (!response.ok) {
-    console.error('Vantrex Supabase request failed:', response.status, body.slice(0, 1000));
-    throw new Error(data?.message || data?.hint || `Supabase request failed (${response.status}).`);
-  }
-  return data;
-}
-
-async function vantrexCreatePayMongoPayment(env, request) {
-  const user = await vantrexSupabaseUser(env, request);
-  const payload = await request.json().catch(() => ({}));
-  const amount = Number(payload.amount);
-  if (!Number.isFinite(amount) || amount < 500 || amount > 999000 || Math.round(amount * 100) !== amount * 100) {
-    return json({ error: 'INVALID_AMOUNT', message: 'Minimum deposit is PHP 500. Use an amount with up to 2 decimal places.' }, 400);
-  }
-
-  const orderId = `VTX${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-  let paymentIntentId = '';
-  try {
-    const intentResponse = await payMongoRequest(env, '/payment_intents', {
-      method: 'POST',
-      body: JSON.stringify({ data: { attributes: {
-        amount: Math.round(amount * 100), currency: 'PHP', payment_method_allowed: ['qrph'],
-        description: `Vantrex Deposit ${orderId}`,
-        metadata: { vantrex_order_id: orderId, vantrex_user_id: user.id, platform: 'Vantrex' }
-      } } })
-    });
-    const intent = intentResponse?.data;
-    paymentIntentId = String(intent?.id || '');
-    const clientKey = String(intent?.attributes?.client_key || '');
-    if (!paymentIntentId || !clientKey) throw new Error('PayMongo did not return a valid payment intent.');
-
-    const methodResponse = await payMongoRequest(env, '/payment_methods', {
-      method: 'POST', body: JSON.stringify({ data: { attributes: { type: 'qrph' } } })
-    });
-    const paymentMethodId = String(methodResponse?.data?.id || '');
-    if (!paymentMethodId) throw new Error('PayMongo did not return a QRPH payment method.');
-
-    const attachResponse = await payMongoRequest(env, `/payment_intents/${encodeURIComponent(paymentIntentId)}/attach`, {
-      method: 'POST', body: JSON.stringify({ data: { attributes: { payment_method: paymentMethodId, client_key: clientKey } } })
-    });
-    const attrs = attachResponse?.data?.attributes || intent?.attributes || {};
-    const qrCode = attrs?.next_action?.code?.image_url || attrs?.next_action?.qr_code?.image_url || '';
-    if (!qrCode) throw new Error('PayMongo did not return the QRPH image.');
-
-    await vantrexDb(env, 'transactions', {
-      method: 'POST',
-      headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({
-        user_id: user.id, type: 'deposit', amount, status: 'pending',
-        description: `PayMongo QRPH deposit ${orderId}`,
-        payment_provider: 'paymongo', payment_order_id: orderId,
-        payment_intent_id: paymentIntentId, payment_qr_url: qrCode
-      })
-    });
-    return json({ success: true, orderId, paymentIntentId, qrCode, amount, currency: 'PHP', status: 'pending', paymentMethod: 'QRPH' });
-  } catch (error) {
-    console.error('Vantrex PayMongo create error:', error);
-    return json({ error: 'PAYMENT_CREATE_FAILED', message: error?.message || 'Unable to create payment.' }, 502);
-  }
-}
-
-async function vantrexRechargeStatus(env, request) {
-  const user = await vantrexSupabaseUser(env, request);
-  const orderId = new URL(request.url).searchParams.get('orderId') || '';
-  if (!/^VTX[A-Za-z0-9_-]{10,40}$/.test(orderId)) return json({ error: 'INVALID_ORDER_ID' }, 400);
-  const rows = await vantrexDb(env, `transactions?payment_order_id=eq.${encodeURIComponent(orderId)}&user_id=eq.${encodeURIComponent(user.id)}&select=id,amount,status,description,created_at&limit=1`);
-  if (!rows?.length) return json({ error: 'NOT_FOUND' }, 404);
-  return json({ success: true, orderId, status: rows[0].status, amount: Number(rows[0].amount), transactionId: rows[0].id });
-}
-
-async function vantrexPayMongoWebhook(env, request) {
-  const rawBody = await request.text();
-  const signature = request.headers.get('PayMongo-Signature') || request.headers.get('Paymongo-Signature') || '';
-  if (!(await verifyPayMongoWebhook(env, rawBody, signature))) return json({ error: 'INVALID_SIGNATURE' }, 401);
-  let event;
-  try { event = JSON.parse(rawBody); } catch { return json({ error: 'INVALID_BODY' }, 400); }
-  const eventAttrs = event?.data?.attributes || {};
-  const eventType = String(eventAttrs.type || '').toLowerCase();
-  if (eventType !== 'payment.paid') return json({ received: true, ignored: true });
-
-  const payment = eventAttrs.data || {};
-  const paymentAttrs = payment.attributes || {};
-  const paymentIntentId = String(paymentAttrs.payment_intent_id || paymentAttrs.payment_intent?.id || '');
-  if (!paymentIntentId) return json({ received: true, ignored: true, reason: 'No payment intent reference.' });
-
-  // Always retrieve the intent from PayMongo; never trust client-side status or webhook metadata alone.
-  const intentResponse = await payMongoRequest(env, `/payment_intents/${encodeURIComponent(paymentIntentId)}`, { method: 'GET' });
-  const intent = intentResponse?.data;
-  const intentAttrs = intent?.attributes || {};
-  const metadata = intentAttrs.metadata || {};
-  const orderId = String(metadata.vantrex_order_id || '');
-  const userId = String(metadata.vantrex_user_id || '');
-  if (!/^VTX[A-Za-z0-9_-]{10,40}$/.test(orderId) || !userId) return json({ received: true, ignored: true });
-
-  const rows = await vantrexDb(env, `transactions?payment_order_id=eq.${encodeURIComponent(orderId)}&payment_intent_id=eq.${encodeURIComponent(paymentIntentId)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,amount,status&limit=1`);
-  if (!rows?.length) return json({ received: true, ignored: true, reason: 'No matching Vantrex transaction.' });
-  const tx = rows[0];
-  const expectedCents = Math.round(Number(tx.amount) * 100);
-  const actualCents = Number(intentAttrs.amount ?? paymentAttrs.amount);
-  const currency = String(intentAttrs.currency || paymentAttrs.currency || '').toUpperCase();
-  if (currency !== 'PHP' || !Number.isFinite(actualCents) || actualCents !== expectedCents) {
-    console.error('Vantrex PayMongo amount/currency mismatch', { orderId, expectedCents, actualCents, currency });
-    return json({ error: 'PAYMENT_MISMATCH' }, 409);
-  }
-
-  // The SQL RPC locks the pending transaction and credits the profile exactly once.
-  await vantrexDb(env, 'rpc/vantrex_confirm_paymongo_deposit', {
-    method: 'POST', body: JSON.stringify({ p_order_id: orderId, p_payment_intent_id: paymentIntentId, p_amount_cents: actualCents })
-  });
-  return json({ received: true, credited: true, orderId });
-}
-
 async function router(
   env,
   request
 ) {
 
-  const vantrexUrl = new URL(request.url);
-  const vantrexPath = vantrexUrl.pathname.replace(/\/$/, '') || '/';
-  if (request.method === 'OPTIONS') return withCors(new Response(null, { status: 204 }));
-  if (request.method === 'POST' && vantrexPath === '/vantrex/create-paymongo-payment') {
-    return withCors(await vantrexCreatePayMongoPayment(env, request));
-  }
-  if (request.method === 'GET' && vantrexPath === '/vantrex/recharge-status') {
-    return withCors(await vantrexRechargeStatus(env, request));
-  }
-  if (request.method === 'POST' && vantrexPath === '/vantrex/paymongo-webhook') {
-    return withCors(await vantrexPayMongoWebhook(env, request));
-  }
-
-  const path =
+  const rawPath =
     new URL(
       request.url
     ).pathname;
+
+  const path =
+    rawPath.replace(/^\/vantrex(?=\/|$)/, "") || "/";
 
 
   if (
